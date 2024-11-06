@@ -134,26 +134,36 @@ async def monitor_file_changes():
     
     try:
         while manager.monitoring:
-            if await manager.check_file_changes():
-                data = await manager.read_all_data()
-                if data is not None:
-                    # Convert current data to JSON for comparison
-                    current_data_json = json.dumps(data, sort_keys=True)
-                    last_data_json = json.dumps(manager.last_data, sort_keys=True) if manager.last_data else None
-                    
-                    if current_data_json != last_data_json:
-                        logger.info("Data content changed, broadcasting update")
-                        await manager.broadcast_data({
-                            "type": "data_update",
-                            "data": data,
-                            "timestamp": datetime.now().isoformat()
-                        })
-                        manager.last_data = data
-            
-            await asyncio.sleep(60)  # Check every minute
+            try:
+                if await manager.check_file_changes():
+                    data = await manager.read_all_data()
+                    if data is not None:
+                        # Convert current data to JSON for comparison
+                        current_data_json = json.dumps(data, sort_keys=True)
+                        last_data_json = json.dumps(manager.last_data, sort_keys=True) if manager.last_data else None
+                        
+                        if current_data_json != last_data_json:
+                            logger.info("Data content changed, broadcasting update")
+                            await manager.broadcast_data({
+                                "type": "data_update",
+                                "data": data,
+                                "timestamp": datetime.now().isoformat()
+                            })
+                            manager.last_data = data
+                        else:
+                            logger.debug("Data content unchanged")
+                    else:
+                        logger.warning("Failed to read data")
+                
+                # Reduced polling interval for more frequent updates
+                await asyncio.sleep(30)  # Check every 30 seconds instead of 60
+                
+            except Exception as e:
+                logger.error(f"Error in monitoring loop: {e}")
+                await asyncio.sleep(5)  # Brief pause before retrying
             
     except Exception as e:
-        logger.error(f"Error in monitor task: {e}")
+        logger.error(f"Fatal error in monitor task: {e}")
         manager.monitoring = False
     
     logger.info("File monitoring task stopped")
