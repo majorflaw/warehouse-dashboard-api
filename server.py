@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 import json
 import asyncio
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from datetime import datetime
 import logging
 import os
@@ -33,86 +33,161 @@ logger = logging.getLogger(__name__)
 
 class DropboxClient:
     def __init__(self, app_key: str, app_secret: str, refresh_token: str):
+        """
+        Initialize the DropboxClient with OAuth2 credentials.
+        
+        Args:
+            app_key (str): Dropbox app key
+            app_secret (str): Dropbox app secret
+            refresh_token (str): OAuth2 refresh token
+        """
+        if not app_key or not app_secret or not refresh_token:
+            raise ValueError("All OAuth2 credentials (app_key, app_secret, refresh_token) must be provided")
+        
         self.app_key = app_key
         self.app_secret = app_secret
         self.refresh_token = refresh_token
-        self._access_token: Optional[str] = None
-        self._token_expiry: Optional[float] = None
         self._client: Optional[Dropbox] = None
+        
+        # Log initialization but not the sensitive values
+        logger.info("Initializing DropboxClient")
+        logger.debug("App key length: %d", len(app_key))
+        logger.debug("App secret length: %d", len(app_secret))
+        logger.debug("Refresh token length: %d", len(refresh_token))
 
     async def get_client(self) -> Dropbox:
-        """Get a Dropbox client, refreshing the token if necessary"""
-        if not self._client or self._should_refresh_token():
-            await self._refresh_access_token()
+        """Get a Dropbox client, creating it if necessary."""
+        if not self._client:
+            await self._create_client()
         return self._client
 
-    def _should_refresh_token(self) -> bool:
-        """Check if token should be refreshed"""
-        if not self._token_expiry:
-            return True
-        # Refresh if token expires in less than 10 minutes
-        return time.time() + 600 > self._token_expiry
-
-    async def _refresh_access_token(self):
-        """Refresh the access token using the refresh token"""
+    async def _create_client(self):
+        """Create a new Dropbox client instance."""
         try:
-            auth_flow = DropboxOAuth2FlowNoRedirect(
-                self.app_key,
-                self.app_secret,
-                token_access_type='offline'
-            )
-            
-            # Get a new access token using the refresh token
-            oauth_result = auth_flow.refresh_access_token(self.refresh_token)
-            
-            # Update the client and token information
-            self._access_token = oauth_result.access_token
-            self._token_expiry = time.time() + oauth_result.expires_in
             self._client = Dropbox(
                 oauth2_refresh_token=self.refresh_token,
                 app_key=self.app_key,
-                app_secret=self.app_secret
+                app_secret=self.app_secret,
+                session=None
             )
-            
-            logger.info("Successfully refreshed Dropbox access token")
-            
+            logger.info("Successfully created new Dropbox client")
         except Exception as e:
-            logger.error(f"Error refreshing Dropbox token: {e}")
+            logger.error(f"Error creating Dropbox client: {str(e)}")
             raise
 
-    async def files_download(self, path: str):
-        """Download a file from Dropbox with automatic token refresh"""
+    async def files_download(self, path: str) -> Tuple[FileMetadata, bytes]:
+        """
+        Download a file from Dropbox with automatic retry logic.
+        
+        Args:
+            path (str): Path to the file in Dropbox
+            
+        Returns:
+            Tuple[FileMetadata, bytes]: File metadata and content
+            
+        Raises:
+            ApiError: If there's an error accessing Dropbox API
+            AuthError: If there's an authentication error
+            Exception: For other errors
+        """
         max_retries = 3
+        retry_delay = 1  # seconds
+
         for attempt in range(max_retries):
             try:
                 client = await self.get_client()
-                return client.files_download(path)
+                metadata, response = client.files_download(path)
+                logger.info(f"Successfully downloaded file: {path}")
+                return metadata, response.content
+
             except AuthError as e:
+                logger.warning(f"Authentication error on attempt {attempt + 1}: {str(e)}")
                 if attempt < max_retries - 1:
-                    logger.warning(f"Auth error, attempting refresh: {e}")
-                    await self._refresh_access_token()
+                    await self._create_client()
+                    time.sleep(retry_delay)
                 else:
                     raise
+
             except ApiError as e:
-                logger.error(f"Dropbox API error: {e}")
+                if e.error.is_path() and e.error.get_path().is_not_found():
+                    logger.error(f"File not found: {path}")
+                    raise
+                logger.error(f"Dropbox API error: {str(e)}")
                 raise
 
-    async def files_get_metadata(self, path: str):
-        """Get file metadata from Dropbox with automatic token refresh"""
+            except Exception as e:
+                logger.error(f"Unexpected error downloading file: {str(e)}")
+                raise
+
+    async def files_get_metadata(self, path: str) -> FileMetadata:
+        """
+        Get metadata for a file in Dropbox with automatic retry logic.
+        
+        Args:
+            path (str): Path to the file in Dropbox
+            
+        Returns:
+            FileMetadata: Metadata of the file
+            
+        Raises:
+            ApiError: If there's an error accessing Dropbox API
+            AuthError: If there's an authentication error
+            Exception: For other errors
+        """
         max_retries = 3
+        retry_delay = 1  # seconds
+
         for attempt in range(max_retries):
             try:
                 client = await self.get_client()
-                return client.files_get_metadata(path)
+                metadata = client.files_get_metadata(path)
+                logger.info(f"Successfully got metadata for: {path}")
+                return metadata
+
             except AuthError as e:
+                logger.warning(f"Authentication error on attempt {attempt + 1}: {str(e)}")
                 if attempt < max_retries - 1:
-                    logger.warning(f"Auth error, attempting refresh: {e}")
-                    await self._refresh_access_token()
+                    await self._create_client()
+                    time.sleep(retry_delay)
                 else:
                     raise
+
             except ApiError as e:
-                logger.error(f"Dropbox API error: {e}")
+                if e.error.is_path() and e.error.get_path().is_not_found():
+                    logger.error(f"File not found: {path}")
+                    raise
+                logger.error(f"Dropbox API error: {str(e)}")
                 raise
+
+            except Exception as e:
+                logger.error(f"Unexpected error getting metadata: {str(e)}")
+                raise
+
+    async def read_file(self, path: str) -> Optional[pd.DataFrame | dict]:
+        """
+        Read a file from Dropbox and return its contents as either a DataFrame or dict.
+        
+        Args:
+            path (str): Path to the file in Dropbox
+            
+        Returns:
+            Optional[Union[pd.DataFrame, dict]]: File contents as DataFrame for CSV files,
+                                               dict for JSON files, or None on error
+        """
+        try:
+            _, content = await self.files_download(path)
+            
+            if path.endswith('.csv'):
+                return pd.read_csv(BytesIO(content))
+            elif path.endswith('.json'):
+                return json.loads(content.decode())
+            else:
+                logger.error(f"Unsupported file type: {path}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error reading file {path}: {str(e)}")
+            return None
 
 class ConnectionManager:
     def __init__(self):
