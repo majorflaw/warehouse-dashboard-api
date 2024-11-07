@@ -98,7 +98,7 @@ class DropboxClient:
                 client = await self.get_client()
                 metadata, response = client.files_download(path)
                 logger.info(f"Successfully downloaded file: {path}")
-                return metadata, response.content
+                return metadata, response
 
             except AuthError as e:
                 logger.warning(f"Authentication error on attempt {attempt + 1}: {str(e)}")
@@ -191,27 +191,28 @@ class DropboxClient:
 
 class ConnectionManager:
     def __init__(self):
-        # WebSocket connection management
         self.active_connections: List[WebSocket] = []
-        
-        # Data tracking
         self.last_modified = {}
         self.last_data = None
         self.monitoring = False
         
         # Initialize Dropbox client
-        self.dbx = DropboxClient(
-            app_key=os.getenv('DROPBOX_APP_KEY'),
-            app_secret=os.getenv('DROPBOX_APP_SECRET'),
-            refresh_token=os.getenv('DROPBOX_REFRESH_TOKEN')
-        )
-        
+        try:
+            self.dbx = DropboxClient(
+                app_key=os.getenv('DROPBOX_APP_KEY', ''),
+                app_secret=os.getenv('DROPBOX_APP_SECRET', ''),
+                refresh_token=os.getenv('DROPBOX_REFRESH_TOKEN', '')
+            )
+        except Exception as e:
+            logger.error(f"Failed to initialize DropboxClient: {e}")
+            raise
+
         # Define file paths in Dropbox
         self.files = {
-            'shipments': '/open_shipments.csv',
-            'p2b_stats': '/p2b_statistics.json',
-            'legacy_stats': '/legacy_statistics.json',
-            'total_stats': '/total_statistics.json'
+            'shipments': '/warehouse-dashboard/open_shipments.csv',
+            'p2b_stats': '/warehouse-dashboard/p2b_statistics.json',
+            'legacy_stats': '/warehouse-dashboard/legacy_statistics.json',
+            'total_stats': '/warehouse-dashboard/total_statistics.json'
         }
 
     # WebSocket connection management methods
@@ -245,12 +246,11 @@ class ConnectionManager:
         """Read file content from Dropbox"""
         try:
             metadata, response = await self.dbx.files_download(path)
-            content = response.content
             
             if path.endswith('.csv'):
-                return pd.read_csv(BytesIO(content))
+                return pd.read_csv(BytesIO(response.content))
             elif path.endswith('.json'):
-                return json.loads(content.decode())
+                return json.loads(response.content.decode())
             
         except Exception as e:
             logger.error(f"Error reading file from Dropbox: {e}")
