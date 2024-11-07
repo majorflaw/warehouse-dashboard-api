@@ -209,10 +209,10 @@ class ConnectionManager:
 
         # Define file paths in Dropbox
         self.files = {
-            'shipments': 'open_shipments.csv',
-            'p2b_stats': 'p2b_statistics.json',
-            'legacy_stats': 'legacy_statistics.json',
-            'total_stats': 'total_statistics.json'
+            'shipments': '/open_shipments.csv',
+            'p2b_stats': '/p2b_statistics.json',
+            'legacy_stats': '/legacy_statistics.json',
+            'total_stats': '/total_statistics.json'
         }
 
     # WebSocket connection management methods
