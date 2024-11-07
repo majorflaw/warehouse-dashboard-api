@@ -4,11 +4,14 @@ import pandas as pd
 import numpy as np
 import json
 import asyncio
-from typing import List
+from typing import List, Optional
 from datetime import datetime
 import logging
 import os
+import time
 from dropbox import Dropbox
+from dropbox.oauth import DropboxOAuth2FlowNoRedirect
+from dropbox.exceptions import AuthError, ApiError
 from dropbox.files import FileMetadata
 from io import BytesIO
 from contextlib import asynccontextmanager
@@ -28,14 +31,105 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+class DropboxClient:
+    def __init__(self, app_key: str, app_secret: str, refresh_token: str):
+        self.app_key = app_key
+        self.app_secret = app_secret
+        self.refresh_token = refresh_token
+        self._access_token: Optional[str] = None
+        self._token_expiry: Optional[float] = None
+        self._client: Optional[Dropbox] = None
+
+    async def get_client(self) -> Dropbox:
+        """Get a Dropbox client, refreshing the token if necessary"""
+        if not self._client or self._should_refresh_token():
+            await self._refresh_access_token()
+        return self._client
+
+    def _should_refresh_token(self) -> bool:
+        """Check if token should be refreshed"""
+        if not self._token_expiry:
+            return True
+        # Refresh if token expires in less than 10 minutes
+        return time.time() + 600 > self._token_expiry
+
+    async def _refresh_access_token(self):
+        """Refresh the access token using the refresh token"""
+        try:
+            auth_flow = DropboxOAuth2FlowNoRedirect(
+                self.app_key,
+                self.app_secret,
+                token_access_type='offline'
+            )
+            
+            # Get a new access token using the refresh token
+            oauth_result = auth_flow.refresh_access_token(self.refresh_token)
+            
+            # Update the client and token information
+            self._access_token = oauth_result.access_token
+            self._token_expiry = time.time() + oauth_result.expires_in
+            self._client = Dropbox(
+                oauth2_refresh_token=self.refresh_token,
+                app_key=self.app_key,
+                app_secret=self.app_secret
+            )
+            
+            logger.info("Successfully refreshed Dropbox access token")
+            
+        except Exception as e:
+            logger.error(f"Error refreshing Dropbox token: {e}")
+            raise
+
+    async def files_download(self, path: str):
+        """Download a file from Dropbox with automatic token refresh"""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                client = await self.get_client()
+                return client.files_download(path)
+            except AuthError as e:
+                if attempt < max_retries - 1:
+                    logger.warning(f"Auth error, attempting refresh: {e}")
+                    await self._refresh_access_token()
+                else:
+                    raise
+            except ApiError as e:
+                logger.error(f"Dropbox API error: {e}")
+                raise
+
+    async def files_get_metadata(self, path: str):
+        """Get file metadata from Dropbox with automatic token refresh"""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                client = await self.get_client()
+                return client.files_get_metadata(path)
+            except AuthError as e:
+                if attempt < max_retries - 1:
+                    logger.warning(f"Auth error, attempting refresh: {e}")
+                    await self._refresh_access_token()
+                else:
+                    raise
+            except ApiError as e:
+                logger.error(f"Dropbox API error: {e}")
+                raise
+
 class ConnectionManager:
     def __init__(self):
+        # WebSocket connection management
         self.active_connections: List[WebSocket] = []
-        self.last_modified = {}  # Track last modified time for each file
+        
+        # Data tracking
+        self.last_modified = {}
         self.last_data = None
         self.monitoring = False
+        
         # Initialize Dropbox client
-        self.dbx = Dropbox(os.getenv('DROPBOX_ACCESS_TOKEN'))
+        self.dbx = DropboxClient(
+            app_key=os.getenv('DROPBOX_APP_KEY'),
+            app_secret=os.getenv('DROPBOX_APP_SECRET'),
+            refresh_token=os.getenv('DROPBOX_REFRESH_TOKEN')
+        )
         
         # Define file paths in Dropbox
         self.files = {
@@ -45,6 +139,7 @@ class ConnectionManager:
             'total_stats': '/total_statistics.json'
         }
 
+    # WebSocket connection management methods
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
         self.active_connections.append(websocket)
@@ -70,10 +165,11 @@ class ConnectionManager:
         for connection in disconnected:
             self.disconnect(connection)
 
+    # Dropbox interaction methods
     async def read_file_from_dropbox(self, path: str):
         """Read file content from Dropbox"""
         try:
-            metadata, response = self.dbx.files_download(path)
+            metadata, response = await self.dbx.files_download(path)
             content = response.content
             
             if path.endswith('.csv'):
@@ -92,7 +188,7 @@ class ConnectionManager:
             
             for file_key, file_path in self.files.items():
                 try:
-                    metadata = self.dbx.files_get_metadata(file_path)
+                    metadata = await self.dbx.files_get_metadata(file_path)
                     last_modified = metadata.server_modified
                     
                     if (file_key not in self.last_modified or 
@@ -113,17 +209,30 @@ class ConnectionManager:
         """Read all necessary data from Dropbox"""
         try:
             # Read shipments data
-            df = await self.read_file_from_dropbox(self.files['shipments'])
-            if df is None:
-                return None
+            shipments_df = await self.read_file_from_dropbox(self.files['shipments'])
+            if shipments_df is None:
+                return None, None
                 
-            df = df.replace([np.inf, -np.inf], None)
-            df = df.replace({np.nan: None})
-            return df.to_dict(orient='records')
-            
+            shipments_df = shipments_df.replace([np.inf, -np.inf], None)
+            shipments_df = shipments_df.replace({np.nan: None})
+            shipments_data = shipments_df.to_dict(orient='records')
+
+            # Read statistics data
+            p2b_stats = await self.read_file_from_dropbox(self.files['p2b_stats'])
+            legacy_stats = await self.read_file_from_dropbox(self.files['legacy_stats'])
+            total_stats = await self.read_file_from_dropbox(self.files['total_stats'])
+
+            statistics = {
+                'p2b': p2b_stats,
+                'legacy': legacy_stats,
+                'total': total_stats
+            }
+
+            return shipments_data, statistics
+                
         except Exception as e:
             logger.error(f"Error reading all data: {e}")
-            return None
+            return None, None
 
 manager = ConnectionManager()
 
@@ -136,7 +245,7 @@ async def monitor_file_changes():
         while manager.monitoring:
             try:
                 if await manager.check_file_changes():
-                    data = await manager.read_all_data()
+                    data, statistics = await manager.read_all_data()
                     if data is not None:
                         # Convert current data to JSON for comparison
                         current_data_json = json.dumps(data, sort_keys=True)
@@ -147,6 +256,7 @@ async def monitor_file_changes():
                             await manager.broadcast_data({
                                 "type": "data_update",
                                 "data": data,
+                                "statistics": statistics,
                                 "timestamp": datetime.now().isoformat()
                             })
                             manager.last_data = data
@@ -156,7 +266,7 @@ async def monitor_file_changes():
                         logger.warning("Failed to read data")
                 
                 # Reduced polling interval for more frequent updates
-                await asyncio.sleep(30)  # Check every 30 seconds instead of 60
+                await asyncio.sleep(30)  # Check every 30 seconds
                 
             except Exception as e:
                 logger.error(f"Error in monitoring loop: {e}")
@@ -206,11 +316,12 @@ async def websocket_endpoint(websocket: WebSocket):
     
     try:
         # Send initial data
-        data = await manager.read_all_data()
+        data, statistics = await manager.read_all_data()
         if data is not None:
             await websocket.send_json({
                 "type": "initial_data",
                 "data": data,
+                "statistics": statistics,
                 "timestamp": datetime.now().isoformat()
             })
             logger.info("Sent initial data to new client")
